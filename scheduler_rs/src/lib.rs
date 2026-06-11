@@ -67,8 +67,8 @@ pub mod types;
 // 重新导出常用类型，方便外部使用。
 pub use buffer::{process_buffer, Overlappable, ProcessBufferResult};
 pub use calendar::{
-    make_range, parse_calendar_to_structured, parse_cron_string, parse_duration,
-    validate_interval, validate_structured_calendar, CompiledCalendar, ParseMode,
+    make_range, parse_calendar_to_structured, parse_cron_string, parse_duration, validate_interval,
+    validate_structured_calendar, CompiledCalendar, ParseMode,
 };
 pub use error::SpecError;
 pub use spec::{

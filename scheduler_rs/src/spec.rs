@@ -59,8 +59,7 @@ use crate::calendar::{
 };
 use crate::error::SpecError;
 use crate::types::{
-    GetNextTimeResult, IntervalSpec, Range, ScheduleSpec, StructuredCalendarSpec,
-    MAX_CALENDAR_YEAR,
+    GetNextTimeResult, IntervalSpec, Range, ScheduleSpec, StructuredCalendarSpec, MAX_CALENDAR_YEAR,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,32 +106,23 @@ impl CompiledSpec {
     ///
     /// Returns `GetNextTimeResult` where both fields are `None` if there is
     /// no matching time (schedule exhausted or past end time).
-    pub fn get_next_time(
-        &self,
-        jitter_seed: &str,
-        after: Timestamp,
-    ) -> GetNextTimeResult {
+    pub fn get_next_time(&self, jitter_seed: &str, after: Timestamp) -> GetNextTimeResult {
         // If we're starting before the schedule's allowed time range, jump
         // up to right before it (so that we can still return the first
         // second of the range if it happens to match).
         let after = match self.spec.start_time {
             Some(start) if after < start => {
                 // start - 1 second; fall back to after on overflow
-                start
-                    .checked_sub(Duration::from_secs(1))
-                    .unwrap_or(after)
+                start.checked_sub(Duration::from_secs(1)).unwrap_or(after)
             }
             _ => after,
         };
 
-        let past_end_time = |t: Timestamp| -> bool {
-            self.spec.end_time.map_or(false, |end| t > end)
-        };
+        let past_end_time =
+            |t: Timestamp| -> bool { self.spec.end_time.map_or(false, |end| t > end) };
 
         fn timestamp_year(t: Timestamp) -> i32 {
-            t.to_zoned(jiff::tz::TimeZone::UTC)
-                .datetime()
-                .year() as i32
+            t.to_zoned(jiff::tz::TimeZone::UTC).datetime().year() as i32
         }
 
         // Nominal time before jitter.
@@ -193,9 +183,7 @@ impl CompiledSpec {
         // Calendars
         for cal in &self.calendar {
             if let Some(t) = cal.next(after) {
-                min_ts = min_ts.map_or(Some(t), |m| {
-                    Some(if t < m { t } else { m })
-                });
+                min_ts = min_ts.map_or(Some(t), |m| Some(if t < m { t } else { m }));
             }
         }
 
@@ -204,9 +192,7 @@ impl CompiledSpec {
         for iv in &self.spec.interval {
             let next_secs = next_interval_time(iv, after_secs);
             if let Ok(next) = Timestamp::from_second(next_secs) {
-                min_ts = min_ts.map_or(Some(next), |m| {
-                    Some(if next < m { next } else { m })
-                });
+                min_ts = min_ts.map_or(Some(next), |m| Some(if next < m { next } else { m }));
             }
         }
 
@@ -252,10 +238,7 @@ impl SpecBuilder {
     /// This canonicalizes the spec (converting cron/calendar strings into
     /// structured form), validates all entries, loads the timezone, and
     /// compiles the structured calendars.
-    pub fn new_compiled_spec(
-        &self,
-        spec: &ScheduleSpec,
-    ) -> Result<CompiledSpec, SpecError> {
+    pub fn new_compiled_spec(&self, spec: &ScheduleSpec) -> Result<CompiledSpec, SpecError> {
         let spec = canonicalize_spec(spec)?;
 
         // Load timezone
@@ -284,10 +267,7 @@ impl SpecBuilder {
     }
 
     /// Load the timezone from the spec.  Uses the cache for IANA names.
-    fn load_timezone(
-        &self,
-        spec: &ScheduleSpec,
-    ) -> Result<jiff::tz::TimeZone, SpecError> {
+    fn load_timezone(&self, spec: &ScheduleSpec) -> Result<jiff::tz::TimeZone, SpecError> {
         // If custom timezone data is provided, load from TZif bytes.
         if let Some(ref data) = spec.timezone_data {
             return jiff::tz::TimeZone::tzif(&spec.timezone_name, data)
@@ -301,12 +281,8 @@ impl SpecBuilder {
         };
 
         self.tz_cache
-            .get(name)
-            .unwrap_or_else(|| {
-                let result = jiff::tz::TimeZone::get(name)
-                    .map_err(|e| format!("timezone '{name}': {e}"));
-                self.tz_cache.insert(name.to_string(), result.clone());
-                result
+            .get_with(name.to_string(), || {
+                jiff::tz::TimeZone::get(name).map_err(|e| format!("timezone '{name}': {e}"))
             })
             .map_err(SpecError::TimezoneNotFound)
     }
@@ -439,7 +415,8 @@ fn clean_cal(scs: &mut StructuredCalendarSpec) {
 pub fn next_interval_time(iv: &IntervalSpec, after_secs: i64) -> i64 {
     let interval = (iv.interval.as_secs() as i64).max(1);
     let phase = (iv.phase.as_secs() as i64).max(0);
-    (((after_secs - phase) / interval) + 1) * interval + phase
+    // div_euclid 确保向下整除
+    ((after_secs - phase).div_euclid(interval) + 1) * interval + phase
 }
 
 // ---------------------------------------------------------------------------
@@ -455,18 +432,16 @@ pub fn next_interval_time(iv: &IntervalSpec, after_secs: i64) -> i64 {
 /// 3. Compute 32-bit FarmHash fingerprint
 /// 4. Scale to the range [0, max_jitter) using the `(hash * max_ms) >> 32`
 ///    technique
-pub fn add_jitter(
-    seed: &str,
-    nominal: Timestamp,
-    max_jitter: Duration,
-) -> Timestamp {
+pub fn add_jitter(seed: &str, nominal: Timestamp, max_jitter: Duration) -> Timestamp {
     if max_jitter.is_zero() {
         return nominal;
     }
 
-    // Serialize to bytes: use RFC 3339 string
-    let nominal_str = nominal.to_string();
-    let mut buf: Vec<u8> = nominal_str.into_bytes();
+    // 预分配准确的容量，避免 Vec 扩容
+    let mut buf = Vec::with_capacity(12 + seed.len());
+    // 直接写入 8 字节秒 + 4 字节纳秒，速度极快
+    buf.extend_from_slice(&nominal.as_second().to_le_bytes());
+    buf.extend_from_slice(&nominal.subsec_nanosecond().to_le_bytes());
     buf.extend_from_slice(seed.as_bytes());
 
     let fp: u64 = farmhash::fingerprint32(&buf) as u64;
@@ -474,11 +449,7 @@ pub fn add_jitter(
     let jitter_ms: u64 = (fp * max_ms) >> 32;
     let jitter = Duration::from_millis(jitter_ms);
 
-    // saturating_add returns Result; use expect as overflow here indicates
-    // a bug (timestamp too far in the future beyond representable range).
-    nominal
-        .checked_add(jitter)
-        .expect("jittered timestamp out of representable range")
+    nominal.checked_add(jitter).unwrap_or(nominal)
 }
 
 // ---------------------------------------------------------------------------
@@ -493,20 +464,11 @@ mod tests {
 
     fn ts(y: i32, mo: i32, d: i32, h: i32, m: i32, s: i32, _ns: i32) -> Timestamp {
         let dt = civil_date(y, mo, d, h, m, s);
-        let zoned = jiff::tz::TimeZone::UTC
-            .to_zoned(dt)
-            .expect("valid time");
+        let zoned = jiff::tz::TimeZone::UTC.to_zoned(dt).expect("valid time");
         zoned.timestamp()
     }
 
-    fn civil_date(
-        y: i32,
-        mo: i32,
-        d: i32,
-        h: i32,
-        m: i32,
-        s: i32,
-    ) -> jiff::civil::DateTime {
+    fn civil_date(y: i32, mo: i32, d: i32, h: i32, m: i32, s: i32) -> jiff::civil::DateTime {
         jiff::civil::DateTime::from_parts(
             date(y as i16, mo as i8, d as i8),
             jiff::civil::Time::new(h as i8, m as i8, s as i8, 0).unwrap(),
@@ -644,9 +606,7 @@ mod tests {
         let res = cs.get_next_time("", start);
         assert!(res.next.is_some());
         // Should be >= start_time
-        assert!(
-            res.next.unwrap().as_second() >= ts(2022, 3, 23, 12, 0, 0, 0).as_second()
-        );
+        assert!(res.next.unwrap().as_second() >= ts(2022, 3, 23, 12, 0, 0, 0).as_second());
     }
 
     #[test]

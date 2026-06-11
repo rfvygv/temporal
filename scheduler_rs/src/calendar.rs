@@ -42,8 +42,8 @@ use jiff::{
 
 use crate::error::SpecError;
 use crate::types::{
-    CalendarSpec, IntervalSpec, Range, StructuredCalendarSpec, MAX_CALENDAR_YEAR,
-    MAX_COMMENT_LEN, MIN_CALENDAR_YEAR,
+    CalendarSpec, IntervalSpec, Range, StructuredCalendarSpec, MAX_CALENDAR_YEAR, MAX_COMMENT_LEN,
+    MIN_CALENDAR_YEAR,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,13 +61,13 @@ pub struct CompiledCalendar {
     tz: TimeZone,
 
     /// Matching predicates for each field.
-    year:       YearMatcher,
-    month:      BitMatcher,
+    year: YearMatcher,
+    month: BitMatcher,
     day_of_month: BitMatcher,
-    day_of_week:  BitMatcher,
-    hour:       BitMatcher,
-    minute:     BitMatcher,
-    second:     BitMatcher,
+    day_of_week: BitMatcher,
+    hour: BitMatcher,
+    minute: BitMatcher,
+    second: BitMatcher,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,171 +233,146 @@ impl CompiledCalendar {
         mut s: i32,
         mut dst_offset: Option<i64>,
     ) -> Option<Timestamp> {
-        // Normalize seconds
-        if s >= 60 {
-            m += 1;
-            s = 0;
-        }
-        // Normalize minutes
-        if m >= 60 {
-            let prev_dt = civil_date(y, mo, d, h, 0, 0);
-            h += 1;
-            m = 0;
-            let next_dt = civil_date(y, mo, d, h, 0, 0);
-            if dst_offset.is_none() {
-                // Compare the true elapsed time by converting to timestamps.
-                let prev_ts = self.tz.to_zoned(prev_dt).ok().map(|z| z.timestamp());
-                let next_ts = self.tz.to_zoned(next_dt).ok().map(|z| z.timestamp());
-                if let (Some(p), Some(n)) = (prev_ts, next_ts) {
-                    let gap_secs = n.as_second() - p.as_second();
-                    if gap_secs > 3600 {
-                        // We skipped over a DST repeated hour. Back up and try
-                        // with offset.
-                        h -= 1;
-                        dst_offset = Some(3600);
+        // 【核心重构 1】使用状态机 loop 替代尾递归，绝对防止 Stack Overflow
+        loop {
+            // -------------------------------------------------------------
+            // 归一化 (Normalization) 阶段
+            // 利用状态机特性，当下面任意字段 +=1 并 continue 后，
+            // 都会回到这里统一处理进位，避免了复杂的级联判断代码。
+            // -------------------------------------------------------------
+            if s >= 60 {
+                m += 1;
+                s = 0;
+            }
+            if m >= 60 {
+                let prev_dt = civil_date(y, mo, d, h, 0, 0);
+                h += 1;
+                m = 0;
+                let next_dt = civil_date(y, mo, d, h, 0, 0);
+                if dst_offset.is_none() {
+                    let prev_ts = self.tz.to_zoned(prev_dt).ok().map(|z| z.timestamp());
+                    let next_ts = self.tz.to_zoned(next_dt).ok().map(|z| z.timestamp());
+                    if let (Some(p), Some(n)) = (prev_ts, next_ts) {
+                        let gap_secs = n.as_second() - p.as_second();
+                        if gap_secs > 3600 {
+                            h -= 1;
+                            dst_offset = Some(3600);
+                        } else {
+                            dst_offset = None;
+                        }
                     } else {
                         dst_offset = None;
                     }
                 } else {
                     dst_offset = None;
                 }
-            } else {
+            }
+            if h >= 24 {
+                d += 1;
+                h = 0;
+            }
+            if d > days_in_month(mo, y) {
+                mo += 1;
+                d = 1;
+            }
+            if mo > 12 {
+                y += 1;
+                mo = 1;
+            }
+            if y > MAX_CALENDAR_YEAR {
+                return None; // 超出最大年份，安全退出
+            }
+
+            // -------------------------------------------------------------
+            // 匹配 (Matching) 阶段
+            // 不匹配时，只需给当前字段 +1 并重置更小的字段，然后 continue
+            // 顶部的归一化阶段会自动处理所有进位逻辑。
+            // -------------------------------------------------------------
+
+            if !self.year.matches(y) {
+                y += 1;
+                mo = 1;
+                d = 1;
+                h = 0;
+                m = 0;
+                s = 0;
                 dst_offset = None;
+                continue;
             }
-        }
-        // Normalize hours
-        if h >= 24 {
-            d += 1;
-            h = 0;
-        }
-        // Normalize day
-        if d > days_in_month(mo, y) {
-            mo += 1;
-            d = 1;
-        }
-        // Normalize month
-        if mo > 12 {
-            y += 1;
-            mo = 1;
-        }
-        if y > MAX_CALENDAR_YEAR {
-            return None;
-        }
+            if !self.month.matches(mo) {
+                mo += 1;
+                d = 1;
+                h = 0;
+                m = 0;
+                s = 0;
+                dst_offset = None;
+                continue;
+            }
+            // 【核心重构 2】传入 &self.tz 借用，消除 Arc clone 的并发争用开销
+            if !self.day_of_month.matches(d)
+                || !self
+                    .day_of_week
+                    .matches(date_weekday(y, mo, d, &self.tz) as i32)
+            {
+                d += 1;
+                h = 0;
+                m = 0;
+                s = 0;
+                dst_offset = None;
+                continue;
+            }
+            if !self.hour.matches(h) {
+                h += 1;
+                m = 0;
+                s = 0;
+                dst_offset = None;
+                continue;
+            }
+            if !self.minute.matches(m) {
+                m += 1;
+                s = 0;
+                dst_offset = None;
+                continue;
+            }
+            if !self.second.matches(s) {
+                s += 1;
+                dst_offset = None;
+                continue;
+            }
 
-        // Check year (skip to next year if it doesn't match)
-        if !self.year.matches(y) {
-            return self.search(y + 1, 1, 1, 0, 0, 0, None);
-        }
-        // Check month (advance within year)
-        if !self.month.matches(mo) {
-            let next_mo = mo + 1;
-            if next_mo > 12 {
-                return self.search(y + 1, 1, 1, 0, 0, 0, None);
-            }
-            return self.search(y, next_mo, 1, 0, 0, 0, None);
-        }
-        // Check day (advance within month)
-        if !self.day_of_month.matches(d)
-            || !self
-                .day_of_week
-                .matches(date_weekday(y, mo, d, self.tz.clone()) as i32)
-        {
-            let next_d = d + 1;
-            if next_d > days_in_month(mo, y) {
-                let next_mo = mo + 1;
-                if next_mo > 12 {
-                    return self.search(y + 1, 1, 1, 0, 0, 0, None);
+            // -------------------------------------------------------------
+            // 构建结果与 DST 校验阶段
+            // -------------------------------------------------------------
+            let civil_dt = civil_date(y, mo, d, h, m, s);
+            let zoned = match self.tz.to_zoned(civil_dt) {
+                Ok(z) => z,
+                Err(_) => {
+                    // 时间不存在（比如夏令时拨快 1 小时导致的空洞）
+                    h += 1;
+                    m = 0;
+                    s = 0;
+                    dst_offset = None;
+                    continue;
                 }
-                return self.search(y, next_mo, 1, 0, 0, 0, None);
-            }
-            return self.search(y, mo, next_d, 0, 0, 0, None);
-        }
-        // Check hour
-        if !self.hour.matches(h) {
-            let next_h = h + 1;
-            if next_h >= 24 {
-                let next_d = d + 1;
-                if next_d > days_in_month(mo, y) {
-                    let next_mo = mo + 1;
-                    if next_mo > 12 {
-                        return self.search(y + 1, 1, 1, 0, 0, 0, None);
-                    }
-                    return self.search(y, next_mo, 1, 0, 0, 0, None);
-                }
-                return self.search(y, mo, next_d, 0, 0, 0, None);
-            }
-            return self.search(y, mo, d, next_h, 0, 0, None);
-        }
-        // Check minute
-        if !self.minute.matches(m) {
-            let next_m = m + 1;
-            if next_m >= 60 {
-                let next_h = h + 1;
-                if next_h >= 24 {
-                    let next_d = d + 1;
-                    if next_d > days_in_month(mo, y) {
-                        let next_mo = mo + 1;
-                        if next_mo > 12 {
-                            return self.search(y + 1, 1, 1, 0, 0, 0, None);
-                        }
-                        return self.search(y, next_mo, 1, 0, 0, 0, None);
-                    }
-                    return self.search(y, mo, next_d, 0, 0, 0, None);
-                }
-                return self.search(y, mo, d, next_h, 0, 0, None);
-            }
-            return self.search(y, mo, d, h, next_m, 0, None);
-        }
-        // Check second
-        if !self.second.matches(s) {
-            let next_s = s + 1;
-            if next_s >= 60 {
-                let next_m = m + 1;
-                if next_m >= 60 {
-                    let next_h = h + 1;
-                    if next_h >= 24 {
-                        let next_d = d + 1;
-                        if next_d > days_in_month(mo, y) {
-                            let next_mo = mo + 1;
-                            if next_mo > 12 {
-                                return self.search(y + 1, 1, 1, 0, 0, 0, None);
-                            }
-                            return self.search(y, next_mo, 1, 0, 0, 0, None);
-                        }
-                        return self.search(y, mo, next_d, 0, 0, 0, None);
-                    }
-                    return self.search(y, mo, d, next_h, 0, 0, None);
-                }
-                return self.search(y, mo, d, h, next_m, 0, None);
-            }
-            return self.search(y, mo, d, h, m, next_s, None);
-        }
+            };
 
-        // Everything matches — build the resulting Zoned time.
-        let civil_dt = civil_date(y, mo, d, h, m, s);
-        let zoned = match self.tz.to_zoned(civil_dt) {
-            Ok(z) => z,
-            Err(_) => {
-                // Non-existent time (DST spring-forward gap).
-                // Skip to next hour.
-                return self.search(y, mo, d, h + 1, 0, 0, None);
+            // DST 偏移校验：如果生成的本地小时和我们预期的小时不一样，跳到下一个小时
+            if zoned.datetime().hour() != h as i8 {
+                h += 1;
+                m = 0;
+                s = 0;
+                dst_offset = None;
+                continue;
             }
-        };
-        // DST gap check: if the resulting hour differs from what we intended,
-        // skip to the next hour.
-        if zoned.datetime().hour() != h as i8 {
-            return self.search(y, mo, d, h + 1, 0, 0, None);
-        }
 
-        let ts = zoned.timestamp();
-        // If we were in a DST repeated hour, add the extra offset.
-        if let Some(off) = dst_offset {
-            return Some(
-                ts.checked_add(time::Duration::from_secs(off as u64))
-                    .expect("dst-offset timestamp overflow"),
-            );
+            let ts = zoned.timestamp();
+            if let Some(off) = dst_offset {
+                // 【核心重构 3】消除 expect 隐患。一旦溢出则返回 None。
+                return ts.checked_add(time::Duration::from_secs(off as u64)).ok();
+            }
+
+            return Some(ts);
         }
-        Some(ts)
     }
 }
 
@@ -415,7 +390,7 @@ fn civil_date(y: i32, mo: i32, d: i32, h: i32, m: i32, s: i32) -> DateTime {
 /// Compute the day-of-week for a (y, mo, d) in the given timezone.
 /// Returns 0 = Sunday, …, 6 = Saturday.
 /// Falls back to UTC when the date is not representable in the timezone.
-fn date_weekday(y: i32, mo: i32, d: i32, tz: TimeZone) -> u8 {
+fn date_weekday(y: i32, mo: i32, d: i32, tz: &TimeZone) -> u8 {
     let yi: i16 = y.try_into().expect("year fits in i16");
     let date = Date::new(yi, mo as i8, d as i8).expect("valid date");
     let civil_dt = DateTime::from_parts(date, Time::midnight());
@@ -431,7 +406,9 @@ fn date_weekday(y: i32, mo: i32, d: i32, tz: TimeZone) -> u8 {
 
 /// Parses a `CalendarSpec` (crontab-like string fields) into a
 /// `StructuredCalendarSpec`.
-pub fn parse_calendar_to_structured(cal: &CalendarSpec) -> Result<StructuredCalendarSpec, SpecError> {
+pub fn parse_calendar_to_structured(
+    cal: &CalendarSpec,
+) -> Result<StructuredCalendarSpec, SpecError> {
     let mut errs: Vec<String> = Vec::new();
 
     let mut make_range_or_nil =
@@ -449,14 +426,7 @@ pub fn parse_calendar_to_structured(cal: &CalendarSpec) -> Result<StructuredCale
         second: make_range_or_nil(&cal.second, "Second", "0", 0, 59, ParseMode::Int),
         minute: make_range_or_nil(&cal.minute, "Minute", "0", 0, 59, ParseMode::Int),
         hour: make_range_or_nil(&cal.hour, "Hour", "0", 0, 23, ParseMode::Int),
-        day_of_week: make_range_or_nil(
-            &cal.day_of_week,
-            "DayOfWeek",
-            "*",
-            0,
-            7,
-            ParseMode::Dow,
-        ),
+        day_of_week: make_range_or_nil(&cal.day_of_week, "DayOfWeek", "*", 0, 7, ParseMode::Dow),
         day_of_month: make_range_or_nil(
             &cal.day_of_month,
             "DayOfMonth",
@@ -577,11 +547,10 @@ fn parse_cron_interval(c: &str) -> Result<IntervalSpec, SpecError> {
         None => (rest, None),
     };
 
-    let interval = parse_duration(interval_str)
-        .map_err(|e| SpecError::RangeError {
-            field: "Interval".into(),
-            detail: e.to_string(),
-        })?;
+    let interval = parse_duration(interval_str).map_err(|e| SpecError::RangeError {
+        field: "Interval".into(),
+        detail: e.to_string(),
+    })?;
 
     let phase = match phase_str {
         Some(p) => parse_duration(p).map_err(|e| SpecError::RangeError {
@@ -687,13 +656,29 @@ pub enum ParseMode {
 
 /// Month names (index 0 = January).
 const MONTH_STRINGS: [&str; 12] = [
-    "january", "february", "march", "april", "may", "june", "july", "august", "september",
-    "october", "november", "december",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 ];
 
 /// Day-of-week names (index 0 = Sunday).
 const DOW_STRINGS: [&str; 7] = [
-    "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
 ];
 
 /// Parse a range string like `"1-5/2,8-11"` into a list of `Range`.
@@ -743,12 +728,10 @@ pub fn make_range(
                         detail: format!("{field} missing step value"),
                     });
                 }
-                let step_val = st
-                    .parse::<i32>()
-                    .map_err(|_| SpecError::RangeError {
-                        field: field.into(),
-                        detail: "invalid step".into(),
-                    })?;
+                let step_val = st.parse::<i32>().map_err(|_| SpecError::RangeError {
+                    field: field.into(),
+                    detail: "invalid step".into(),
+                })?;
                 if step_val < 1 {
                     return Err(SpecError::RangeError {
                         field: field.into(),
@@ -778,14 +761,13 @@ pub fn make_range(
                     detail: format!("{field} Start is not in range [{min_val}-{max_val}]"),
                 }
             })?;
-            let en = parse_value(e1, st, max_val, parse_mode).map_err(|_| {
-                SpecError::RangeError {
+            let en =
+                parse_value(e1, st, max_val, parse_mode).map_err(|_| SpecError::RangeError {
                     field: field.into(),
                     detail: format!(
                         "{field} End is before Start or not in range [{min_val}-{max_val}]"
                     ),
-                }
-            })?;
+                })?;
             (st, en)
         } else {
             let st = parse_value(base, min_val, max_val, parse_mode).map_err(|_| {
@@ -809,7 +791,12 @@ pub fn make_range(
                 }
             }
             let end = if start == 7 && end == 7 { 6 } else { 6 };
-            add_range(&mut ranges, start, if seven_included { end } else { end }, step);
+            add_range(
+                &mut ranges,
+                start,
+                if seven_included { end } else { end },
+                step,
+            );
         } else {
             add_range(&mut ranges, start, end, step);
         }
@@ -991,38 +978,17 @@ mod tests {
     #[test]
     fn test_parse_predefined_cron() {
         assert_eq!(handle_predefined_cron_strings("@hourly"), "0 * * * *");
-        assert_eq!(
-            handle_predefined_cron_strings("@daily"),
-            "0 0 * * *"
-        );
-        assert_eq!(
-            handle_predefined_cron_strings("@weekly"),
-            "0 0 * * 0"
-        );
-        assert_eq!(
-            handle_predefined_cron_strings("@monthly"),
-            "0 0 1 * *"
-        );
-        assert_eq!(
-            handle_predefined_cron_strings("@yearly"),
-            "0 0 1 1 *"
-        );
-        assert_eq!(
-            handle_predefined_cron_strings("@annually"),
-            "0 0 1 1 *"
-        );
+        assert_eq!(handle_predefined_cron_strings("@daily"), "0 0 * * *");
+        assert_eq!(handle_predefined_cron_strings("@weekly"), "0 0 * * 0");
+        assert_eq!(handle_predefined_cron_strings("@monthly"), "0 0 1 * *");
+        assert_eq!(handle_predefined_cron_strings("@yearly"), "0 0 1 1 *");
+        assert_eq!(handle_predefined_cron_strings("@annually"), "0 0 1 1 *");
     }
 
     #[test]
     fn test_parse_duration() {
-        assert_eq!(
-            parse_duration("90m").unwrap(),
-            Duration::from_secs(90 * 60)
-        );
-        assert_eq!(
-            parse_duration("3h").unwrap(),
-            Duration::from_secs(3 * 3600)
-        );
+        assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(90 * 60));
+        assert_eq!(parse_duration("3h").unwrap(), Duration::from_secs(3 * 3600));
         assert_eq!(
             parse_duration("5m44s").unwrap(),
             Duration::from_secs(5 * 60 + 44)

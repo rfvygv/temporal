@@ -105,7 +105,7 @@ pub struct ProcessBufferResult<T> {
 /// [`ProcessBufferResult`] 包含了哪些需要立即启动、哪些需要缓冲、
 /// 是否需要取消/终止等决策。
 pub fn process_buffer<T, F>(
-    buffer: &[T],
+    buffer: impl IntoIterator<Item = T>,
     is_running: bool,
     resolve: F,
 ) -> ProcessBufferResult<T>
@@ -123,20 +123,20 @@ where
         overlap_skipped_by_policy: BTreeMap::new(),
     };
 
-    for start in buffer.iter() {
+    for start in buffer.into_iter() {
         // 第一步：解析重叠策略（将 Unspecified 映射为默认策略）
         let overlap_policy = resolve(start.overlap_policy());
 
         // 第二步：ALLOW_ALL 策略 — 收集到 concurrent 列表，所有此类项同时启动
         if overlap_policy == ScheduleOverlapPolicy::AllowAll {
-            action.overlapping_starts.push(start.clone());
+            action.overlapping_starts.push(start);
             continue;
         }
 
         // 第三步：无重叠情况 — 没有任何工作流在运行时，第一个非 ALLOW_ALL 项直接启动
         // 注意：即使策略是 SKIP，在没有重叠时也应该启动（SKIP 只在有重叠时生效）
         if !is_running && action.non_overlapping_start.is_none() {
-            action.non_overlapping_start = Some(start.clone());
+            action.non_overlapping_start = Some(start);
             continue;
         }
 
@@ -153,7 +153,7 @@ where
             ScheduleOverlapPolicy::BufferOne => {
                 // BUFFER_ONE: 缓冲区中最多保留一个
                 if action.new_buffer.is_empty() {
-                    action.new_buffer.push(start.clone());
+                    action.new_buffer.push(start);
                 } else {
                     action.overlap_skipped += 1;
                     *action
@@ -164,26 +164,26 @@ where
             }
             ScheduleOverlapPolicy::BufferAll => {
                 // BUFFER_ALL: 无限制地放入缓冲区
-                action.new_buffer.push(start.clone());
+                action.new_buffer.push(start);
             }
             ScheduleOverlapPolicy::CancelOther => {
                 // CANCEL_OTHER: 抢占式 — 取消当前运行的，用此项替换
                 if is_running {
                     // 有实际运行的工作流 → 异步取消它，此项放入缓冲区等待取消完成
                     action.need_cancel = true;
-                    action.new_buffer.push(start.clone());
+                    action.new_buffer.push(start);
                 } else {
                     // 还没真正运行（只有 NonOverlappingStart 被设置了）→ 直接替换
-                    action.non_overlapping_start = Some(start.clone());
+                    action.non_overlapping_start = Some(start);
                 }
             }
             ScheduleOverlapPolicy::TerminateOther => {
                 // TERMINATE_OTHER: 同 CANCEL_OTHER，但使用终止而非取消
                 if is_running {
                     action.need_terminate = true;
-                    action.new_buffer.push(start.clone());
+                    action.new_buffer.push(start);
                 } else {
-                    action.non_overlapping_start = Some(start.clone());
+                    action.non_overlapping_start = Some(start);
                 }
             }
             ScheduleOverlapPolicy::Unspecified => {
@@ -240,7 +240,7 @@ mod tests {
     /// 空缓冲区 → 无操作。
     #[test]
     fn test_buffer_empty() {
-        let result = process_buffer::<TestStart, _>(&[], false, resolve);
+        let result = process_buffer::<TestStart, _>([], false, resolve);
         assert!(result.non_overlapping_start.is_none());
         assert!(result.overlapping_starts.is_empty());
         assert!(result.new_buffer.is_empty());
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn test_buffer_first_goes_when_not_running() {
         let buf = vec![make_start("a", ScheduleOverlapPolicy::Skip)];
-        let result = process_buffer(&buf, false, resolve);
+        let result = process_buffer(buf, false, resolve);
         assert_eq!(
             result.non_overlapping_start.as_ref().map(|s| s.id),
             Some("a")
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_buffer_skip_when_running() {
         let buf = vec![make_start("a", ScheduleOverlapPolicy::Skip)];
-        let result = process_buffer(&buf, true, resolve);
+        let result = process_buffer(buf, true, resolve);
         assert!(result.non_overlapping_start.is_none());
         assert_eq!(result.overlap_skipped, 1);
     }
@@ -279,7 +279,7 @@ mod tests {
             make_start("b", ScheduleOverlapPolicy::BufferOne),
         ];
         // 未运行 → 第一项直接启动，第二项缓冲
-        let result = process_buffer(&buf, false, resolve);
+        let result = process_buffer(buf.clone(), false, resolve);
         assert_eq!(
             result.non_overlapping_start.as_ref().map(|s| s.id),
             Some("a")
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(result.new_buffer[0].id, "b");
 
         // 运行中 → 第一项进入缓冲，第二项被跳过
-        let result2 = process_buffer(&buf, true, resolve);
+        let result2 = process_buffer(buf, true, resolve);
         assert!(result2.non_overlapping_start.is_none());
         assert_eq!(result2.new_buffer.len(), 1);
         assert_eq!(result2.new_buffer[0].id, "a");
@@ -304,7 +304,7 @@ mod tests {
             make_start("a", ScheduleOverlapPolicy::BufferAll),
             make_start("b", ScheduleOverlapPolicy::BufferAll),
         ];
-        let result = process_buffer(&buf, false, resolve);
+        let result = process_buffer(buf.clone(), false, resolve);
         assert_eq!(
             result.non_overlapping_start.as_ref().map(|s| s.id),
             Some("a")
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(result.new_buffer.len(), 1);
         assert_eq!(result.new_buffer[0].id, "b");
 
-        let result2 = process_buffer(&buf, true, resolve);
+        let result2 = process_buffer(buf, true, resolve);
         assert!(result2.non_overlapping_start.is_none());
         assert_eq!(result2.new_buffer.len(), 2);
         assert_eq!(result2.new_buffer[0].id, "a");
@@ -327,13 +327,13 @@ mod tests {
         let buf = vec![make_start("a", ScheduleOverlapPolicy::CancelOther)];
 
         // 运行中 → 需要取消
-        let result = process_buffer(&buf, true, resolve);
+        let result = process_buffer(buf.clone(), true, resolve);
         assert!(result.need_cancel);
         assert_eq!(result.new_buffer.len(), 1);
         assert_eq!(result.new_buffer[0].id, "a");
 
         // 未运行 → 替换
-        let result2 = process_buffer(&buf, false, resolve);
+        let result2 = process_buffer(buf, false, resolve);
         assert!(!result2.need_cancel);
         assert_eq!(
             result2.non_overlapping_start.as_ref().map(|s| s.id),
@@ -347,12 +347,12 @@ mod tests {
         let buf = vec![make_start("a", ScheduleOverlapPolicy::TerminateOther)];
 
         // 运行中 → 需要终止
-        let result = process_buffer(&buf, true, resolve);
+        let result = process_buffer(buf.clone(), true, resolve);
         assert!(result.need_terminate);
         assert_eq!(result.new_buffer.len(), 1);
 
         // 未运行 → 替换
-        let result2 = process_buffer(&buf, false, resolve);
+        let result2 = process_buffer(buf, false, resolve);
         assert!(!result2.need_terminate);
         assert_eq!(
             result2.non_overlapping_start.as_ref().map(|s| s.id),
@@ -368,7 +368,7 @@ mod tests {
             make_start("b", ScheduleOverlapPolicy::AllowAll),
             make_start("c", ScheduleOverlapPolicy::Skip),
         ];
-        let result = process_buffer(&buf, false, resolve);
+        let result = process_buffer(buf, false, resolve);
         assert_eq!(result.overlapping_starts.len(), 2);
         assert_eq!(result.overlapping_starts[0].id, "a");
         assert_eq!(result.overlapping_starts[1].id, "b");
@@ -386,7 +386,7 @@ mod tests {
             make_start("a", ScheduleOverlapPolicy::AllowAll),
             make_start("b", ScheduleOverlapPolicy::CancelOther),
         ];
-        let result = process_buffer(&buf, true, resolve);
+        let result = process_buffer(buf, true, resolve);
         // 有 cancel/terminate 时 ALLOW_ALL 项被清空
         assert!(result.overlapping_starts.is_empty());
         assert!(result.need_cancel);
